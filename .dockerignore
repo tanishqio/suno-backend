@@ -1,0 +1,5 @@
+.git
+__pycache__
+*.db
+tests
+noisy_audio(1to10)/*.ipynb

@@ -2,15 +2,15 @@
 Database models for hearing test state management.
 """
 from datetime import datetime
-from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, DateTime, JSON
+from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, DateTime, JSON, LargeBinary
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
-DATABASE_URL = "sqlite:///./hearing_tests.db"
+from config import DATABASE_URL
 
 engine = create_engine(
-    DATABASE_URL, 
-    connect_args={"check_same_thread": False}
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -21,45 +21,36 @@ class HearingTest(Base):
     """Model for storing hearing test state and results."""
     __tablename__ = "hearing_tests"
 
-    id = Column(String, primary_key=True, index=True)  # test_id
+    id = Column(String, primary_key=True, index=True)
     phone = Column(String, index=True)
     call_id = Column(String, index=True)
-    current_step = Column(Integer, default=0)
-    total_steps = Column(Integer)
-    correct_answers = Column(Integer, default=0)
+    language = Column(String)
+    total_trials = Column(Integer)
+    correct_trials = Column(Integer, default=0)
     final_score = Column(Float, nullable=True)
     interpretation = Column(String, nullable=True)
     recommendation = Column(String, nullable=True)
-    
-    # JSON array of answers: [{"step": 1, "expected": "1", "pressed": "1", "correct": true}]
-    answers = Column(JSON, default=[])
-    
-    # JSON array of used audio clip indices to avoid repetition
-    used_audio_indices = Column(JSON, default=[])
-    
+
+    # One entry per trial, the last one is the trial in progress. Always assign a new list:
+    # in-place changes to a JSON column are not saved.
+    # {"trial": 1, "digits": "695", "files": [...], "pressed": "695", "correct": true, "answered_at": "..."}
+    trials = Column(JSON, default=list)
+
     is_finished = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    def to_dict(self):
-        return {
-            "test_id": self.id,
-            "phone": self.phone,
-            "call_id": self.call_id,
-            "current_step": self.current_step,
-            "total_steps": self.total_steps,
-            "correct_answers": self.correct_answers,
-            "final_score": self.final_score,
-            "interpretation": self.interpretation,
-            "recommendation": self.recommendation,
-            "is_finished": self.is_finished,
-            "answers": self.answers,
-            "created_at": self.created_at.isoformat(),
-            "updated_at": self.updated_at.isoformat()
-        }
 
 
-# Create tables
+class TrialAudio(Base):
+    """Merged MP3 for one trial, served to Bolna from /audio/{test_id}/{trial}.mp3."""
+    __tablename__ = "trial_audio"
+
+    test_id = Column(String, primary_key=True)
+    trial = Column(Integer, primary_key=True)
+    mp3 = Column(LargeBinary)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(bind=engine)
 
 
