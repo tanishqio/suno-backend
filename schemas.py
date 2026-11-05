@@ -2,44 +2,52 @@
 Pydantic models for request/response validation.
 """
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 
 
 class StartHearingTestRequest(BaseModel):
     """Request to start a new hearing test."""
     phone: str = Field(..., description="User's phone number")
     call_id: str = Field(..., description="Unique call ID from Bolna")
+    language: Optional[Literal["hindi", "english"]] = Field(
+        None, description="Voice language for the whole test; random if omitted"
+    )
 
 
 class StartHearingTestResponse(BaseModel):
     """Response when hearing test starts."""
     test_id: str = Field(..., description="Unique test identifier")
-    audio_url: str = Field(..., description="URL of the audio to play")
-    expected_key: str = Field(..., description="Expected keypad digit (for backend validation only)")
+    trial: int = Field(..., description="Current trial number (1-indexed)")
+    total_trials: int = Field(..., description="Maximum trials in the test")
+    audio_url: str = Field(..., description="Absolute URL of the merged triplet audio to play")
+    expected_digits: str = Field(..., description="The three digits the user should press, e.g. '695'")
     instruction: str = Field(..., description="Instruction text for the user")
-    step: int = Field(..., description="Current step number (1-indexed)")
-    total_steps: int = Field(..., description="Total steps in the test")
+    language: str = Field(..., description="Voice language used for this test")
 
 
 class SubmitAnswerRequest(BaseModel):
-    """Request to submit a keypad answer."""
+    """Request to submit the digits the user pressed."""
     test_id: str = Field(..., description="Test identifier")
-    pressed_key: str = Field(..., description="The digit pressed (0-9)")
     call_id: str = Field(..., description="Call ID for tracking")
+    pressed_digits: str = Field(..., description="Digits pressed via DTMF, e.g. '695' or '6 9 5'")
 
 
 class SubmitAnswerResponse(BaseModel):
     """Response after submitting an answer."""
-    correct: bool = Field(..., description="Whether the answer was correct")
-    current_score: float = Field(..., description="Current score (0-100)")
-    next_audio_url: Optional[str] = Field(None, description="URL of next audio or null if finished")
-    next_expected_key: Optional[str] = Field(None, description="Expected key for next step")
-    instruction: str = Field(..., description="Instruction for next step")
-    step: int = Field(..., description="Current step number")
-    is_finished: bool = Field(..., description="Whether the test is complete")
-    final_score: Optional[float] = Field(None, description="Final score if finished")
-    interpretation: Optional[str] = Field(None, description="Interpretation: 'mild', 'moderate', or 'severe'")
-    recommendation: Optional[str] = Field(None, description="Recommendation text if finished")
+    test_id: str
+    answered_trial: int = Field(..., description="Trial number that was just answered")
+    correct: bool = Field(..., description="Whether all three digits matched in order")
+    correct_trials: int
+    trials_completed: int
+    total_trials: int
+    is_finished: bool
+    instruction: str
+    next_trial: Optional[int] = Field(None, description="Next trial number, null if finished")
+    next_audio_url: Optional[str] = Field(None, description="Absolute URL of the next audio, null if finished")
+    next_expected_digits: Optional[str] = Field(None, description="Digits expected for the next trial")
+    final_score: Optional[float] = Field(None, description="Percentage of trials correct, if finished")
+    interpretation: Optional[str] = Field(None, description="'good', 'mild_difficulty' or 'needs_doctor'")
+    recommendation: Optional[str] = Field(None, description="Recommendation text, if finished")
 
 
 class GetTestResultRequest(BaseModel):
@@ -51,18 +59,13 @@ class GetTestResultResponse(BaseModel):
     """Response with final test results."""
     test_id: str
     phone: str
-    final_score: float = Field(..., description="Final score (0-100)")
-    interpretation: str = Field(..., description="Interpretation: 'mild', 'moderate', or 'severe'")
-    recommendation: str = Field(..., description="Recommendation text")
-    total_steps: int
-    correct_answers: int
-    answers: List[Dict[str, Any]] = Field(..., description="Detailed answer history")
+    language: str
+    final_score: float = Field(..., description="Percentage of trials correct (0-100)")
+    interpretation: str = Field(..., description="'good', 'mild_difficulty' or 'needs_doctor'")
+    recommendation: str
+    total_trials: int
+    correct_trials: int
+    trials: List[Dict[str, Any]] = Field(..., description="Per-trial history")
     is_finished: bool
     created_at: str
     updated_at: str
-
-
-class ErrorResponse(BaseModel):
-    """Generic error response."""
-    error: str = Field(..., description="Error message")
-    detail: Optional[str] = Field(None, description="Additional details")

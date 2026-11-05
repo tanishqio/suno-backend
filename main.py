@@ -1,38 +1,35 @@
 """
-FastAPI backend for voice AI hearing screening agent using Bolna.
+FastAPI backend for the Suno Care Digits-in-Noise hearing screening test, driven by Bolna.
 """
 import logging
 from typing import Annotated
 
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from models import get_db, HearingTest
 from schemas import (
     StartHearingTestRequest, StartHearingTestResponse,
     SubmitAnswerRequest, SubmitAnswerResponse,
-    GetTestResultRequest, GetTestResultResponse,
-    ErrorResponse
+    GetTestResultRequest, GetTestResultResponse
 )
 from services import HearingTestService
-from config import TEST_EXPIRY_MINUTES
+from config import TEST_EXPIRY_MINUTES, PUBLIC_BASE_URL
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Create FastAPI app
 app = FastAPI(
-    title="Hearing Screening Agent API",
-    description="Backend for voice AI hearing screening using Bolna",
-    version="1.0.0"
+    title="Suno Care Digits-in-Noise API",
+    description="Backend for the Digits-in-Noise hearing screening test over Bolna voice calls",
+    version="2.0.0"
 )
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,248 +39,156 @@ app.add_middleware(
 )
 
 
+def audio_url(request: Request, test: HearingTest, trial: int) -> str:
+    """Absolute URL Bolna fetches the merged trial audio from."""
+    base_url = (PUBLIC_BASE_URL or str(request.base_url)).rstrip("/")
+    return f"{base_url}/audio/{test.id}/{trial}.mp3"
+
+
 @app.get("/health", tags=["Health"])
 async def health_check():
-    """Health check endpoint."""
-    return {
-        "status": "healthy",
-        "service": "Hearing Screening Agent API"
-    }
+    return {"status": "healthy", "service": "Suno Care Digits-in-Noise API"}
 
 
 @app.post("/start-hearing-test", response_model=StartHearingTestResponse, tags=["Hearing Test"])
-async def start_hearing_test(
-    request: StartHearingTestRequest,
+def start_hearing_test(
+    body: StartHearingTestRequest,
+    request: Request,
     db: Annotated[Session, Depends(get_db)],
     background_tasks: BackgroundTasks
 ):
     """
-    Start a new hearing test session.
-    
-    This endpoint:
-    1. Creates a new test record
-    2. Selects the first audio clip
-    3. Returns the audio URL for Bolna to play
-    
-    The user then presses a keypad digit, which Bolna sends to /submit-answer.
+    Start a new test: creates the session, picks 3 random digits with one random
+    noisy variant each, and returns the merged audio URL and the expected digits.
     """
-    try:
-        logger.info(f"Starting hearing test for phone: {request.phone}, call_id: {request.call_id}")
-        
-        # Create test
-        test, first_clip = HearingTestService.create_test(
-            db, 
-            phone=request.phone, 
-            call_id=request.call_id
-        )
-        
-        # Store expected key for first step
-        first_clip_data = HearingTestService.start_next_step(db, test.id)
-        
-        # Schedule cleanup of expired tests
-        background_tasks.add_task(
-            HearingTestService.cleanup_expired_tests, 
-            db, 
-            TEST_EXPIRY_MINUTES
-        )
-        
-        return StartHearingTestResponse(
-            test_id=test.id,
-            audio_url=first_clip_data["audio_url"],
-            expected_key=first_clip_data["expected_key"],
-            instruction=first_clip_data["instruction"],
-            step=first_clip_data["step"],
-            total_steps=first_clip_data["total_steps"]
-        )
-    
-    except Exception as e:
-        logger.error(f"Error starting hearing test: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    logger.info(f"Starting hearing test for phone: {body.phone}, call_id: {body.call_id}")
+    test = HearingTestService.create_test(db, body.phone, body.call_id, body.language)
+    background_tasks.add_task(HearingTestService.cleanup_expired_tests, TEST_EXPIRY_MINUTES)
+
+    current = test.trials[-1]
+    return StartHearingTestResponse(
+        test_id=test.id,
+        trial=current["trial"],
+        total_trials=test.total_trials,
+        audio_url=audio_url(request, test, current["trial"]),
+        expected_digits=current["digits"],
+        instruction=HearingTestService.instruction(test),
+        language=test.language
+    )
 
 
 @app.post("/submit-answer", response_model=SubmitAnswerResponse, tags=["Hearing Test"])
-async def submit_answer(
-    request: SubmitAnswerRequest,
+def submit_answer(
+    body: SubmitAnswerRequest,
+    request: Request,
     db: Annotated[Session, Depends(get_db)],
     background_tasks: BackgroundTasks
 ):
     """
-    Submit a keypad answer from the user.
-    
-    Flow:
-    1. User hears audio from /start-hearing-test or /submit-answer
-    2. User presses a digit on their keypad (0-9)
-    3. Bolna sends that digit to this endpoint via DTMF
-    4. Backend validates, updates score, decides next audio
-    5. Returns next audio URL (or null if finished)
-    
-    Bolna repeats steps 1-5 until is_finished=true.
+    Score the digits the user pressed against the server-side answer for the current
+    trial, then return the next trial or the final result.
     """
+    logger.info(f"Processing answer for test: {body.test_id}, pressed: {body.pressed_digits}")
     try:
-        logger.info(f"Processing answer for test: {request.test_id}, "
-                   f"pressed_key: {request.pressed_key}, call_id: {request.call_id}")
-        
-        result = HearingTestService.submit_answer(
-            db, 
-            test_id=request.test_id, 
-            pressed_key=request.pressed_key,
-            call_id=request.call_id
-        )
-        
-        # Schedule cleanup
-        background_tasks.add_task(
-            HearingTestService.cleanup_expired_tests, 
-            db, 
-            TEST_EXPIRY_MINUTES
-        )
-        
-        return SubmitAnswerResponse(
-            correct=result["correct"],
-            current_score=result["current_score"],
-            next_audio_url=result["next_audio_url"],
-            next_expected_key=result["next_expected_key"],
-            instruction=result["instruction"],
-            step=result["step"],
-            is_finished=result["is_finished"],
-            final_score=result["final_score"],
-            interpretation=result["interpretation"],
-            recommendation=result["recommendation"]
-        )
-    
+        test = HearingTestService.submit_answer(db, body.test_id, body.call_id, body.pressed_digits)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
-        logger.error(f"Validation error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error processing answer: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    background_tasks.add_task(HearingTestService.cleanup_expired_tests, TEST_EXPIRY_MINUTES)
+
+    answered = test.trials[-1] if test.is_finished else test.trials[-2]
+    upcoming = None if test.is_finished else test.trials[-1]
+    return SubmitAnswerResponse(
+        test_id=test.id,
+        answered_trial=answered["trial"],
+        correct=answered["correct"],
+        correct_trials=test.correct_trials,
+        trials_completed=answered["trial"],
+        total_trials=test.total_trials,
+        is_finished=test.is_finished,
+        instruction=HearingTestService.instruction(test),
+        next_trial=upcoming and upcoming["trial"],
+        next_audio_url=upcoming and audio_url(request, test, upcoming["trial"]),
+        next_expected_digits=upcoming and upcoming["digits"],
+        final_score=test.final_score,
+        interpretation=test.interpretation,
+        recommendation=test.recommendation
+    )
+
+
+@app.api_route("/audio/{test_id}/{trial}.mp3", methods=["GET", "HEAD"], tags=["Audio"])
+def get_trial_audio(test_id: str, trial: int, db: Annotated[Session, Depends(get_db)]):
+    """Merged triplet audio for one trial of a test."""
+    try:
+        mp3 = HearingTestService.get_trial_audio(db, test_id, trial)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return Response(content=mp3, media_type="audio/mpeg", headers={"Cache-Control": "private, max-age=600"})
 
 
 @app.post("/get-test-result", response_model=GetTestResultResponse, tags=["Hearing Test"])
-async def get_test_result(
-    request: GetTestResultRequest,
-    db: Annotated[Session, Depends(get_db)]
-):
-    """
-    Retrieve the final result of a completed hearing test.
-    
-    Returns:
-    - Final score (0-100)
-    - Interpretation (mild, moderate, severe)
-    - Recommendation text
-    - Detailed answer history
-    """
+def get_test_result(body: GetTestResultRequest, db: Annotated[Session, Depends(get_db)]):
+    """Final result of a completed test with per-trial history."""
     try:
-        logger.info(f"Retrieving test result for test_id: {request.test_id}")
-        
-        result = HearingTestService.get_test_result(db, request.test_id)
-        
-        return GetTestResultResponse(
-            test_id=result["test_id"],
-            phone=result["phone"],
-            final_score=result["final_score"],
-            interpretation=result["interpretation"],
-            recommendation=result["recommendation"],
-            total_steps=result["total_steps"],
-            correct_answers=result["correct_answers"],
-            answers=result["answers"],
-            is_finished=result["is_finished"],
-            created_at=result["created_at"],
-            updated_at=result["updated_at"]
-        )
-    
-    except ValueError as e:
-        logger.error(f"Validation error: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error retrieving result: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        test = HearingTestService.get_test(db, body.test_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    if not test.is_finished:
+        raise HTTPException(status_code=400, detail=f"Test {body.test_id} is not yet finished")
+
+    return GetTestResultResponse(
+        test_id=test.id,
+        phone=test.phone,
+        language=test.language,
+        final_score=test.final_score,
+        interpretation=test.interpretation,
+        recommendation=test.recommendation,
+        total_trials=len(test.trials),
+        correct_trials=test.correct_trials,
+        trials=test.trials,
+        is_finished=test.is_finished,
+        created_at=test.created_at.isoformat(),
+        updated_at=test.updated_at.isoformat()
+    )
 
 
 @app.get("/test-status/{test_id}", tags=["Hearing Test"])
-async def get_test_status(
-    test_id: str,
-    db: Annotated[Session, Depends(get_db)]
-):
-    """
-    Get current status of an ongoing or completed test.
-    
-    Returns:
-    - Current step
-    - Current score
-    - Is finished
-    - All answers so far
-    """
+def get_test_status(test_id: str, db: Annotated[Session, Depends(get_db)]):
+    """Current state of an ongoing or completed test."""
     try:
-        test = db.query(HearingTest).filter(HearingTest.id == test_id).first()
-        if not test:
-            raise HTTPException(status_code=404, detail="Test not found")
-        
-        current_score = (test.correct_answers / test.current_step) * 100 if test.current_step > 0 else 0
-        
-        return {
-            "test_id": test.id,
-            "phone": test.phone,
-            "current_step": test.current_step,
-            "total_steps": test.total_steps,
-            "current_score": current_score,
-            "correct_answers": test.correct_answers,
-            "is_finished": test.is_finished,
-            "final_score": test.final_score,
-            "interpretation": test.interpretation,
-            "answers": test.answers,
-            "created_at": test.created_at.isoformat(),
-            "updated_at": test.updated_at.isoformat()
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting test status: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        test = HearingTestService.get_test(db, test_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    answered = [trial for trial in test.trials if trial["correct"] is not None]
+    return {
+        "test_id": test.id,
+        "phone": test.phone,
+        "language": test.language,
+        "current_trial": test.trials[-1]["trial"],
+        "total_trials": test.total_trials,
+        "trials_completed": len(answered),
+        "correct_trials": test.correct_trials,
+        "current_score": round(test.correct_trials / len(answered) * 100, 1) if answered else 0,
+        "is_finished": test.is_finished,
+        "final_score": test.final_score,
+        "interpretation": test.interpretation,
+        "trials": test.trials,
+        "created_at": test.created_at.isoformat(),
+        "updated_at": test.updated_at.isoformat()
+    }
 
 
 @app.delete("/test/{test_id}", tags=["Hearing Test"])
-async def delete_test(
-    test_id: str,
-    db: Annotated[Session, Depends(get_db)]
-):
-    """
-    Delete a test record.
-    """
+def delete_test(test_id: str, db: Annotated[Session, Depends(get_db)]):
+    """Delete a test and its audio."""
     try:
-        test = db.query(HearingTest).filter(HearingTest.id == test_id).first()
-        if not test:
-            raise HTTPException(status_code=404, detail="Test not found")
-        
-        db.delete(test)
-        db.commit()
-        
-        logger.info(f"Deleted test {test_id}")
-        
-        return {
-            "status": "success",
-            "message": f"Test {test_id} deleted",
-            "test_id": test_id
-        }
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting test: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.on_event("startup")
-async def startup_event():
-    """Run on application startup."""
-    logger.info("Hearing Screening Agent API starting up...")
-    logger.info(f"Database initialized with test expiry time: {TEST_EXPIRY_MINUTES} minutes")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Run on application shutdown."""
-    logger.info("Hearing Screening Agent API shutting down...")
+        HearingTestService.delete_test(db, test_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    logger.info(f"Deleted test {test_id}")
+    return {"status": "success", "message": f"Test {test_id} deleted", "test_id": test_id}
 
 
 if __name__ == "__main__":
